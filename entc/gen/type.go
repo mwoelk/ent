@@ -1839,6 +1839,9 @@ func (f Field) BasicType(ident string) (expr string) {
 		if t.Numeric() && rt.Kind >= reflect.Int && rt.Kind <= reflect.Float64 {
 			expr = fmt.Sprintf("%s(%s)", rt.Kind, ident)
 		}
+		if t.Numeric() && rt.Ident == "decimal.Decimal" {
+			expr = fmt.Sprintf("%s.InexactFloat64()", ident)
+		}
 	}
 	return expr
 }
