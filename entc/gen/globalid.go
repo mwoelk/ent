@@ -18,14 +18,14 @@ import (
 const incrementIdent = "const IncrementStarts"
 
 // IncrementStarts holds the autoincrement start value for each type.
-type IncrementStarts map[string]int64
+type IncrementStarts map[string]int
 
 // IncrementStartAnnotation assigns a unique range to each node in the graph.
 func IncrementStartAnnotation(g *Graph) error {
 	// To ensure we keep the existing type ranges, load the current global id sequence, if there is any.
 	var (
 		r        = make(IncrementStarts)
-		path     = rangesFilePath(g.Target)
+		path     = IncrementStartsFilePath(g.Target)
 		buf, err = os.ReadFile(path)
 	)
 	switch {
@@ -33,6 +33,15 @@ func IncrementStartAnnotation(g *Graph) error {
 	case err != nil:
 		return err
 	default:
+		if ok, _ := g.FeatureEnabled(FeatureSnapshot.Name); ok {
+			if err = ResolveIncrementStartsConflict(g.Target); err != nil {
+				return err
+			}
+			buf, err = os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+		}
 		var (
 			matches = make([][]byte, 0, 2)
 			lines   = bytes.Split(buf, []byte("\n"))
@@ -63,17 +72,13 @@ func IncrementStartAnnotation(g *Graph) error {
 	}
 	// Range over all nodes and assign the increment starting value.
 	var (
-		need []*Type
-		last int64
+		need    []*Type
+		lastIdx = -1
 	)
 	for _, n := range g.Nodes {
-		if n.Annotations == nil {
-			n.Annotations = make(Annotations)
-		}
 		a := n.EntSQL()
 		if a == nil {
 			a = &entsql.Annotation{}
-			n.Annotations[a.Name()] = a
 		}
 		switch v, ok := r[n.Table()]; {
 		case a.IncrementStart != nil:
@@ -86,18 +91,24 @@ func IncrementStartAnnotation(g *Graph) error {
 			// In case this is a new node, it gets the next free increment range (highest value << 32).
 			need = append(need, n)
 		}
-		last = max(last, r[n.Table()])
+		if v, ok := r[n.Table()]; ok {
+			lastIdx = max(lastIdx, v/(1<<32-1))
+		}
+		if err := setAnnotation(n, a); err != nil {
+			return err
+		}
 	}
 	// Compute new ranges and write them back to the file.
-	s := len(g.Nodes) - len(need) // number of nodes with existing increment values
 	for i, n := range need {
-		r[n.Table()] = last + int64(s+i)<<32
+		r[n.Table()] = (lastIdx + i + 1) << 32
 		a := n.EntSQL()
-		a.IncrementStart = func(i int64) *int64 { return &i }(r[n.Table()]) // copy to not override previous values
-		n.Annotations[a.Name()] = a
+		a.IncrementStart = func(i int) *int { return &i }(r[n.Table()]) // copy to not override previous values
+		if err := setAnnotation(n, a); err != nil {
+			return err
+		}
 	}
 	// Ensure increment ranges are exactly of size 1<<32 with no overlaps.
-	d := make(map[int64]string)
+	d := make(map[int]string)
 	for t, s := range r {
 		switch t1, ok := d[s]; {
 		case ok:
@@ -121,6 +132,77 @@ func (IncrementStarts) Name() string {
 	return "IncrementStarts"
 }
 
-func rangesFilePath(dir string) string {
+// WriteToDisk writes the increment starts to the disk.
+func (i IncrementStarts) WriteToDisk(target string) error {
+	initTemplates()
+	p := IncrementStartsFilePath(target)
+	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return templates.Lookup("internal/globalid").
+		Execute(f, &Config{
+			Target:      target,
+			Annotations: Annotations{"IncrementStarts": i},
+		})
+}
+
+func IncrementStartsFilePath(dir string) string {
 	return filepath.Join(dir, "internal", "globalid.go")
+}
+
+// ResolveIncrementStartsConflict resolves git/mercurial conflicts by "accepting theirs".
+func ResolveIncrementStartsConflict(dir string) error {
+	// Expect 2 ranges in the file, accept the second one, since this is the remote content.
+	p := IncrementStartsFilePath(dir)
+	fi, err := os.Stat(p)
+	if err != nil {
+		return err
+	}
+	c, err := os.ReadFile(p)
+	if err != nil {
+		return err
+	}
+	var (
+		fixed             [][]byte
+		conflict, skipped bool
+		lines             = bytes.Split(c, []byte("\n"))
+	)
+	for _, l := range lines {
+		switch {
+		case bytes.HasPrefix(l, []byte("<<<<<<<")):
+			conflict = true
+		case bytes.HasPrefix(l, []byte("=======")), bytes.HasPrefix(l, []byte(">>>>>>>")):
+		case bytes.HasPrefix(l, []byte(incrementIdent)) && conflict && !skipped:
+			skipped = true
+		default:
+			fixed = append(fixed, l)
+		}
+	}
+	return os.WriteFile(p, bytes.Join(fixed, []byte("\n")), fi.Mode())
+}
+
+func ToMap(a *entsql.Annotation) (map[string]any, error) {
+	buf, err := json.Marshal(a)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]any)
+	if err = json.Unmarshal(buf, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func setAnnotation(n *Type, a *entsql.Annotation) error {
+	m, err := ToMap(a)
+	if err != nil {
+		return err
+	}
+	n.Annotations.Set(a.Name(), m)
+	return nil
 }

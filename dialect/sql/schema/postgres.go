@@ -30,6 +30,9 @@ type Postgres struct {
 // init loads the Postgres version from the database for later use in the migration process.
 // It returns an error if the server version is lower than v10.
 func (d *Postgres) init(ctx context.Context) error {
+	if d.version != "" {
+		return nil // already initialized.
+	}
 	rows := &sql.Rows{}
 	if err := d.Query(ctx, "SHOW server_version_num", []any{}, rows); err != nil {
 		return fmt.Errorf("querying server version %w", err)
@@ -112,11 +115,11 @@ func (d *Postgres) atTypeC(c1 *Column, c2 *schema.Column) error {
 	switch c1.Type {
 	case field.TypeBool:
 		t = &schema.BoolType{T: postgres.TypeBoolean}
-	case field.TypeUint8, field.TypeInt8, field.TypeInt16, field.TypeUint16:
+	case field.TypeUint8, field.TypeInt8, field.TypeInt16:
 		t = &schema.IntegerType{T: postgres.TypeSmallInt}
-	case field.TypeInt32, field.TypeUint32:
+	case field.TypeUint16, field.TypeInt32:
 		t = &schema.IntegerType{T: postgres.TypeInt}
-	case field.TypeInt, field.TypeUint, field.TypeInt64, field.TypeUint64:
+	case field.TypeUint32, field.TypeInt, field.TypeUint, field.TypeInt64, field.TypeUint64:
 		t = &schema.IntegerType{T: postgres.TypeBigInt}
 	case field.TypeFloat32:
 		t = &schema.FloatType{T: c1.scanTypeOr(postgres.TypeReal)}
