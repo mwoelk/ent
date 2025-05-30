@@ -10,8 +10,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -29,6 +31,7 @@ type Atlas struct {
 	atDriver   migrate.Driver
 	sqlDialect sqlDialect
 
+	schema          string // schema to use
 	indent          string // plan indentation
 	errNoPlan       bool   // no plan error enabled
 	universalID     bool   // global unique ids
@@ -120,7 +123,7 @@ func (a *Atlas) NamedDiff(ctx context.Context, name string, tables ...*Table) er
 	if a.dir == nil {
 		return errors.New("no migration directory given")
 	}
-	opts := []migrate.PlannerOption{migrate.WithFormatter(a.fmt)}
+	opts := []migrate.PlannerOption{migrate.PlanFormat(a.fmt)}
 	// Validate the migration directory before proceeding.
 	if err := migrate.Validate(a.dir); err != nil {
 		return fmt.Errorf("validating migration directory: %w", err)
@@ -525,15 +528,7 @@ func (a *Atlas) StateReader(tables ...*Table) migrate.StateReaderFunc {
 			}
 			a.sqlDialect = drv
 		}
-		ts, err := a.tables(tables)
-		if err != nil {
-			return nil, err
-		}
-		vs, err := a.views(tables)
-		if err != nil {
-			return nil, err
-		}
-		return &schema.Realm{Schemas: []*schema.Schema{{Tables: ts, Views: vs}}}, nil
+		return a.realm(tables)
 	}
 }
 
@@ -658,16 +653,26 @@ func (a *Atlas) create(ctx context.Context, tables ...*Table) (err error) {
 	return tx.Commit()
 }
 
+// For BC reason, we omit the schema qualifier from the migration plan.
+// This is currently limiting migrations to a single schema.
+// If multi-schema migrations are required, one should use Atlas' schema loader for Ent.
+var noQualifierOpt = func(opts *migrate.PlanOptions) {
+	var noQualifier string
+	opts.SchemaQualifier = &noQualifier
+}
+
 // planInspect creates the current state by inspecting the connected database, computing the current state of the Ent schema
 // and proceeds to diff the changes to create a migration plan.
 func (a *Atlas) planInspect(ctx context.Context, conn dialect.ExecQuerier, name string, tables []*Table) (*migrate.Plan, error) {
-	current, err := a.atDriver.InspectSchema(ctx, "", &schema.InspectOptions{
+	current, err := a.atDriver.InspectSchema(ctx, a.schema, &schema.InspectOptions{
 		Tables: func() (t []string) {
 			for i := range tables {
 				t = append(t, tables[i].Name)
 			}
 			return t
 		}(),
+		// Ent supports table-level inspection only.
+		Mode: schema.InspectSchemas | schema.InspectTables,
 	})
 	if err != nil {
 		return nil, err
@@ -684,14 +689,20 @@ func (a *Atlas) planInspect(ctx context.Context, conn dialect.ExecQuerier, name 
 	if err != nil {
 		return nil, err
 	}
-	desired := realm.Schemas[0]
+	var desired *schema.Schema
+	switch {
+	case realm != nil && len(realm.Schemas) > 0:
+		desired = realm.Schemas[0]
+	default:
+		desired = &schema.Schema{}
+	}
 	desired.Name, desired.Attrs = current.Name, current.Attrs
-	return a.diff(ctx, name, current, desired, a.types[len(types):])
+	return a.diff(ctx, name, current, desired, a.types[len(types):], noQualifierOpt)
 }
 
 func (a *Atlas) planReplay(ctx context.Context, name string, tables []*Table) (*migrate.Plan, error) {
 	// We consider a database clean if there are no tables in the connected schema.
-	s, err := a.atDriver.InspectSchema(ctx, "", nil)
+	s, err := a.atDriver.InspectSchema(ctx, a.schema, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -704,21 +715,21 @@ func (a *Atlas) planReplay(ctx context.Context, name string, tables []*Table) (*
 		return nil, err
 	}
 	if err := ex.ExecuteN(ctx, 0); err != nil && !errors.Is(err, migrate.ErrNoPendingFiles) {
-		return nil, a.cleanSchema(ctx, "", err)
+		return nil, a.cleanSchema(ctx, a.schema, err)
 	}
 	// Inspect the current schema (migration directory).
-	current, err := a.atDriver.InspectSchema(ctx, "", nil)
+	current, err := a.atDriver.InspectSchema(ctx, a.schema, nil)
 	if err != nil {
-		return nil, a.cleanSchema(ctx, "", err)
+		return nil, a.cleanSchema(ctx, a.schema, err)
 	}
 	var types []string
 	if a.universalID {
 		if types, err = a.loadTypes(ctx, a.sqlDialect); err != nil && !errors.Is(err, errTypeTableNotFound) {
-			return nil, a.cleanSchema(ctx, "", err)
+			return nil, a.cleanSchema(ctx, a.schema, err)
 		}
 		a.types = types
 	}
-	if err := a.cleanSchema(ctx, "", nil); err != nil {
+	if err := a.cleanSchema(ctx, a.schema, nil); err != nil {
 		return nil, fmt.Errorf("clean schemas after migration replaying: %w", err)
 	}
 	desired, err := a.tables(tables)
@@ -745,12 +756,7 @@ func (a *Atlas) planReplay(ctx context.Context, name string, tables []*Table) (*
 	}
 	return a.diff(ctx, name, current,
 		&schema.Schema{Name: current.Name, Attrs: current.Attrs, Tables: desired}, a.types[len(types):],
-		// For BC reason, we omit the schema qualifier from the migration scripts,
-		// but that is currently limiting versioned migration to a single schema.
-		func(opts *migrate.PlanOptions) {
-			var noQualifier string
-			opts.SchemaQualifier = &noQualifier
-		},
+		noQualifierOpt,
 	)
 }
 
@@ -832,14 +838,33 @@ func (d *db) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 	return r, nil
 }
 
-// tables converts an Ent table slice to an atlas table slice
-func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
+// tables converts an Ent table slice to an atlas tables.
+func (a *Atlas) realm(tables []*Table) (*schema.Realm, error) {
 	var (
+		sm  = make(map[string]*schema.Schema)
 		byT = make(map[*Table]*schema.Table)
-		ts  = make([]*schema.Table, 0, len(tables))
 	)
 	for _, et := range tables {
+		if _, ok := sm[et.Schema]; !ok {
+			sm[et.Schema] = schema.New(et.Schema)
+		}
+		s := sm[et.Schema]
 		if et.View {
+			if et.Annotation == nil || et.Annotation.ViewAs == "" && et.Annotation.ViewFor[a.dialect] == "" {
+				continue // defined externally
+			}
+			def := et.Annotation.ViewFor[a.dialect]
+			if def == "" {
+				def = et.Annotation.ViewAs
+			}
+			av := schema.NewView(et.Name, def)
+			if et.Comment != "" {
+				av.SetComment(et.Comment)
+			}
+			if err := a.aVColumns(et, av); err != nil {
+				return nil, err
+			}
+			s.AddViews(av)
 			continue
 		}
 		at := schema.NewTable(et.Name)
@@ -851,7 +876,7 @@ func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
 		// The new implementation is based on annotations attached to the schema. Only one can be enabled.
 		switch {
 		case a.universalID && et.Annotation != nil && et.Annotation.IncrementStart != nil:
-			return nil, errors.New("sql/schema: universal id and increment start annotation are mutually exclusive")
+			return nil, errors.New("universal id and increment start annotation are mutually exclusive")
 		case a.universalID && et.Name != TypeTable && len(et.PrimaryKey) == 1:
 			r, err := a.pkRange(et)
 			if err != nil {
@@ -859,7 +884,7 @@ func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
 			}
 			a.sqlDialect.atIncrementT(at, r)
 		case et.Annotation != nil && et.Annotation.IncrementStart != nil:
-			a.sqlDialect.atIncrementT(at, *et.Annotation.IncrementStart)
+			a.sqlDialect.atIncrementT(at, int64(*et.Annotation.IncrementStart))
 		}
 		if err := a.aColumns(et, at); err != nil {
 			return nil, err
@@ -867,7 +892,7 @@ func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
 		if err := a.aIndexes(et, at); err != nil {
 			return nil, err
 		}
-		ts = append(ts, at)
+		s.AddTables(at)
 		byT[et] = at
 	}
 	for _, t1 := range tables {
@@ -888,7 +913,7 @@ func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
 				fk2.AddColumns(c2)
 			}
 			var refT *schema.Table
-			for _, t2 := range ts {
+			for _, t2 := range sm[fk1.RefTable.Schema].Tables {
 				if t2.Name == fk1.RefTable.Name {
 					refT = t2
 					break
@@ -908,31 +933,23 @@ func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
 			t2.AddForeignKeys(fk2)
 		}
 	}
-	return ts, nil
+	ss := slices.SortedFunc(maps.Values(sm), func(a, b *schema.Schema) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return &schema.Realm{Schemas: ss}, nil
 }
 
-// tables converts an Ent table slice to an atlas table slice
-func (a *Atlas) views(tables []*Table) ([]*schema.View, error) {
-	vs := make([]*schema.View, 0, len(tables))
-	for _, et := range tables {
-		// Not a view, or the view defined externally.
-		if !et.View || et.Annotation == nil || (et.Annotation.ViewAs == "" && et.Annotation.ViewFor[a.dialect] == "") {
-			continue
-		}
-		def := et.Annotation.ViewFor[a.dialect]
-		if def == "" {
-			def = et.Annotation.ViewAs
-		}
-		av := schema.NewView(et.Name, def)
-		if et.Comment != "" {
-			av.SetComment(et.Comment)
-		}
-		if err := a.aVColumns(et, av); err != nil {
-			return nil, err
-		}
-		vs = append(vs, av)
+// tables converts an Ent table slice to an atlas table slice.
+func (a *Atlas) tables(tables []*Table) ([]*schema.Table, error) {
+	r, err := a.realm(tables)
+	if err != nil {
+		return nil, err
 	}
-	return vs, nil
+	var ts []*schema.Table
+	for _, s := range r.Schemas {
+		ts = append(ts, s.Tables...)
+	}
+	return ts, nil
 }
 
 func (a *Atlas) aColumns(et *Table, at *schema.Table) error {

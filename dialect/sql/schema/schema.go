@@ -6,10 +6,18 @@
 package schema
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
+	"ariga.io/atlas/sql/migrate"
+	"ariga.io/atlas/sql/mysql"
+	"ariga.io/atlas/sql/postgres"
+	"ariga.io/atlas/sql/schema"
+	"ariga.io/atlas/sql/sqlite"
+	entdialect "entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/entsql"
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/schema/field"
@@ -422,28 +430,6 @@ type ForeignKey struct {
 	OnDelete   ReferenceOption // action on delete.
 }
 
-// DSL returns a default DSL query for a foreign-key.
-func (fk ForeignKey) DSL() *sql.ForeignKeyBuilder {
-	cols := make([]string, len(fk.Columns))
-	refs := make([]string, len(fk.RefColumns))
-	for i, c := range fk.Columns {
-		cols[i] = c.Name
-	}
-	for i, c := range fk.RefColumns {
-		refs[i] = c.Name
-	}
-	dsl := sql.ForeignKey().Symbol(fk.Symbol).
-		Columns(cols...).
-		Reference(sql.Reference().Table(fk.RefTable.Name).Columns(refs...))
-	if action := string(fk.OnDelete); action != "" {
-		dsl.OnDelete(action)
-	}
-	if action := string(fk.OnUpdate); action != "" {
-		dsl.OnUpdate(action)
-	}
-	return dsl
-}
-
 // ReferenceOption for constraint actions.
 type ReferenceOption string
 
@@ -469,24 +455,6 @@ type Index struct {
 	Annotation *entsql.IndexAnnotation // index annotation.
 	columns    []string                // columns loaded from query scan.
 	realname   string                  // real name in the database (Postgres only).
-}
-
-// Builder returns the query builder for index creation. The DSL is identical in all dialects.
-func (i *Index) Builder(table string) *sql.IndexBuilder {
-	idx := sql.CreateIndex(i.Name).Table(table)
-	if i.Unique {
-		idx.Unique()
-	}
-	for _, c := range i.Columns {
-		idx.Column(c.Name)
-	}
-	return idx
-}
-
-// DropBuilder returns the query builder for the drop index.
-func (i *Index) DropBuilder(table string) *sql.DropIndexBuilder {
-	idx := sql.DropIndex(i.Name).Table(table)
-	return idx
 }
 
 // Indexes used for scanning all sql.Rows into a list of indexes, because
@@ -575,4 +543,97 @@ func indexType(idx *Index, d string) (string, bool) {
 		return ant.Type, true
 	}
 	return "", false
+}
+
+type driver struct {
+	sqlDialect
+	schema.Differ
+	migrate.PlanApplier
+}
+
+var drivers = func(v string) map[string]driver {
+	return map[string]driver{
+		entdialect.SQLite: {
+			&SQLite{
+				WithForeignKeys: true,
+				Driver:          nopDriver{dialect: entdialect.SQLite},
+			},
+			sqlite.DefaultDiff,
+			sqlite.DefaultPlan,
+		},
+		entdialect.MySQL: {
+			&MySQL{
+				version: v,
+				Driver:  nopDriver{dialect: entdialect.MySQL},
+			},
+			mysql.DefaultDiff,
+			mysql.DefaultPlan,
+		},
+		entdialect.Postgres: {
+			&Postgres{
+				version: v,
+				Driver:  nopDriver{dialect: entdialect.Postgres},
+			},
+			postgres.DefaultDiff,
+			postgres.DefaultPlan,
+		},
+	}
+}
+
+// Dump the schema DDL for the given tables.
+func Dump(ctx context.Context, dialect, version string, tables []*Table, opts ...migrate.PlanOption) (string, error) {
+	opts = append([]migrate.PlanOption{func(o *migrate.PlanOptions) {
+		o.Mode = migrate.PlanModeDump
+		o.Indent = "  "
+	}}, opts...)
+	d, ok := drivers(version)[dialect]
+	if !ok {
+		return "", fmt.Errorf("unsupported dialect %q", dialect)
+	}
+	r, err := (&Atlas{sqlDialect: d, dialect: dialect}).StateReader(tables...).ReadState(ctx)
+	if err != nil {
+		return "", err
+	}
+	// Since the Atlas version bundled with Ent does not support view management,
+	// simply spit out the definition instead of letting Atlas plan them.
+	var vs []*schema.View
+	for _, s := range r.Schemas {
+		vs = append(vs, s.Views...)
+		s.Views = nil
+	}
+	var c schema.Changes
+	if slices.ContainsFunc(tables, func(t *Table) bool { return t.Schema != "" }) {
+		c, err = d.RealmDiff(&schema.Realm{}, r)
+	} else {
+		c, err = d.SchemaDiff(&schema.Schema{}, r.Schemas[0])
+	}
+	if err != nil {
+		return "", err
+	}
+	p, err := d.PlanChanges(ctx, "dump", c, opts...)
+	if err != nil {
+		return "", err
+	}
+	for _, v := range vs {
+		q, _ := sql.Dialect(dialect).
+			CreateView(v.Name).
+			Schema(v.Schema.Name).
+			Columns(func(cols []*schema.Column) (bs []*sql.ColumnBuilder) {
+				for _, c := range cols {
+					bs = append(bs, sql.Dialect(dialect).Column(c.Name).Type(c.Type.Raw))
+				}
+				return
+			}(v.Columns)...).
+			As(sql.Raw(v.Def)).
+			Query()
+		p.Changes = append(p.Changes, &migrate.Change{
+			Cmd:     q,
+			Comment: fmt.Sprintf("Add %q view", v.Name),
+		})
+	}
+	f, err := migrate.DefaultFormatter.FormatFile(p)
+	if err != nil {
+		return "", err
+	}
+	return string(f.Bytes()), nil
 }
