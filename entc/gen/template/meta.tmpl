@@ -100,7 +100,7 @@ const (
 		ValueScanner struct {
 			{{- range $f := $.Fields }}
 				{{- if $f.HasValueScanner }}
-					{{ $f.StructField }} field.TypeValueScanner[{{ $f.Type }}]
+					{{ $f.StructField }} field.TypeValueScanner[{{if $f.Nillable}}*{{end}}{{ $f.Type }}]
 				{{- end }}
 			{{- end }}
 		}
