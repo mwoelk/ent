@@ -136,7 +136,7 @@ func ({{ $receiver }} *{{ $.Name }}) {{ $.ValueName }}(name string) (ent.Value, 
 		{{- $scantype := $f.ScanType -}}
 		if value, ok := values[{{ $i }}].(*{{ $scantype }}); !ok {
 			return fmt.Errorf("unexpected type %T for field {{ $f.Name }}", values[{{ $i }}])
-		{{- if hasPrefix $scantype "sql.Null" }}
+		{{- if or (hasPrefix $scantype "sql.Null") (hasPrefix $scantype "decimal.Null") }}
 			} else if value.Valid {
 				{{- if $f.NillableValue }}
 					{{ $ret }}.{{ $field }} = new({{ $f.Type }})

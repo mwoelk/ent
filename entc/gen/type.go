@@ -1387,6 +1387,11 @@ func (f Field) NillableValue() bool {
 // ScanType returns the Go type that is used for `rows.Scan`.
 func (f Field) ScanType() string {
 	if f.Type.ValueScanner() {
+		// Use decimal.NullDecimal for decimal types.
+		if f.Type.RType.Ident == "decimal.Decimal" {
+			return "decimal.NullDecimal"
+		}
+
 		if f.Nillable && !f.standardNullType() {
 			return "sql.NullScanner"
 		}
@@ -1465,6 +1470,11 @@ func (f Field) FromValueFunc() (string, error) {
 // nillable-type supported by the SQL driver (e.g. []byte).
 func (f Field) NewScanType() string {
 	if f.Type.ValueScanner() {
+		if f.Type.RType.Ident == "decimal.Decimal" {
+			// Use decimal.NullDecimal for decimal types.
+			return "new(decimal.NullDecimal)"
+		}
+
 		expr := fmt.Sprintf("new(%s)", f.Type.RType.String())
 		if f.Nillable && !f.standardNullType() {
 			expr = fmt.Sprintf("&sql.NullScanner{S: %s}", expr)
@@ -1495,6 +1505,11 @@ func (f Field) NewScanType() string {
 func (f Field) ScanTypeField(rec string) string {
 	expr := rec
 	if f.Type.ValueScanner() {
+		if f.Type.RType.Ident == "decimal.Decimal" {
+			// Use decimal.NullDecimal for decimal types.
+			return fmt.Sprintf("%s.Decimal", expr)
+		}
+
 		if !f.Type.RType.IsPtr() {
 			expr = "*" + expr
 		}
